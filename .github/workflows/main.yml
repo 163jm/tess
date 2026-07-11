@@ -74,16 +74,27 @@ jobs:
             exit 1
           }
 
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Setup MSVC dev environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Configure CMake (Core only)
         shell: pwsh
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+          cmake -S . -B build -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl `
+            -DCMAKE_CXX_COMPILER=cl `
             -DNATIVEPLAYER_CORE_ONLY=ON `
             -DNATIVEPLAYER_BUILD_TESTS=ON
 
       - name: Build Core
         shell: pwsh
-        run: cmake --build build --config Release --target PlayerCore PlayerCoreSmokeTest
+        run: cmake --build build --target PlayerCore PlayerCoreSmokeTest
 
       - name: Copy libmpv-2.dll next to smoke test exe
         shell: pwsh
