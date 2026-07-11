@@ -40,5 +40,10 @@ if(NOT EXISTS ${LIBMPV_INCLUDE_DIR}/mpv/client.h)
     message(WARNING "未找到 ${LIBMPV_INCLUDE_DIR}/mpv/client.h — 请先按照 third_party/libmpv/README.md 放置 libmpv 开发包。")
 endif()
 
+option(NATIVEPLAYER_CORE_ONLY "只配置 Core 静态库，跳过 App（App 依赖 WinUI3/XAML，纯 CMake 不驱动编译）" OFF)
+
 add_subdirectory(Core)
-add_subdirectory(App)
+
+if(NOT NATIVEPLAYER_CORE_ONLY)
+    add_subdirectory(App)
+endif()

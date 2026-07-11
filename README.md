@@ -51,7 +51,47 @@ NativePlayer/
    `WINDOWSAPPSDK_VERSION` 是示例值，实际以你 NuGet 还原到的版本为准，
    通常不需要手动改（VS 项目模板会自动管理）
 
-## 下一步（阶段 2 预告）
+## CI 自动编译（GitHub Actions）
+
+`.github/workflows/build-windows.yml` 提供了两个 job，push/PR 到仓库或手动
+触发（`workflow_dispatch`）都会跑：
+
+1. **`build-core`**（稳，推荐先看这个）
+   - 自动从 `shinchiro/mpv-winbuild-cmake` 的最新 GitHub Release 下载
+     libmpv 开发包并放置到 `third_party/libmpv/`
+   - 用 CMake + MSVC 只编译 `Core` 静态库和一个冒烟测试可执行文件
+     （`Core/tests/smoke_test.cpp`：验证 DLL 能加载、`mpv_create/initialize/
+     terminate_destroy` 调用不崩溃）
+   - 真正**运行**冒烟测试 exe，日志里能直接看到成功/失败
+   - 产物：`PlayerCore.lib`、`PlayerCoreSmokeTest.exe`
+
+2. **`build-app`**（风险较高，`continue-on-error: true`，失败不会让整个
+   workflow 标红，但日志会完整保留）
+   - 同样先下载 libmpv
+   - 用 `nuget restore` + `msbuild` 编译完整的 `NativePlayer.sln`
+     （`App` WinUI3 项目 + `Core` 静态库，含 XAML 编译、Windows App SDK /
+     C++/WinRT / ANGLE 的 NuGet 还原）
+   - 产物：`build/msbuild.log`（详细编译日志，排查配置问题用）和
+     编译出的 exe（如果成功）
+
+### 怎么看结果
+
+- 去仓库的 Actions 标签页，看 `Build NativePlayer (Windows)` 这个 workflow
+  的运行记录
+- `build-core` 是判断"mpv 封装代码本身没问题"的**基准信号**；如果这个都
+  失败，说明 `Core/` 里的代码有编译期问题，需要先修
+- `build-app` 大概率第一次跑会因为 NuGet 包版本号不对、vcxproj 里某个
+  路径/GUID/属性配置有误而失败——**这是预期的**，下载 `msbuild-log`
+  artifact，把报错内容发给我，我们照着日志逐条修
+
+### 手动触发并指定 libmpv 版本
+
+如果自动抓的"最新 release"版本有问题，可以在 Actions 页面手动触发
+`workflow_dispatch`，在 `libmpv_release_tag` 输入框填一个具体的
+release tag（去 <https://github.com/shinchiro/mpv-winbuild-cmake/releases>
+看可用的 tag）。
+
+
 
 跑通阶段 1 后，下一步是把 FlutterPlayer 的 `video_player_page.dart` /
 `video_player_controller.dart` 里的完整播放控制条（进度条拖拽、音量、
