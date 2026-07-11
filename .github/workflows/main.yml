@@ -1,0 +1,199 @@
+name: Build NativePlayer (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      libmpv_release_tag:
+        description: "shinchiro/mpv-winbuild-cmake release tag（留空则自动取最新 release）"
+        required: false
+        default: ""
+
+env:
+  # mpv-winbuild-cmake 的 release asset 命名格式会变化，workflow 里用通配匹配
+  LIBMPV_REPO: shinchiro/mpv-winbuild-cmake
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Job 1: 只编译 Core 静态库 + 冒烟测试可执行文件。
+  # 不依赖 WinUI3/XAML，纯 CMake + MSVC，用来快速验证 mpv 封装代码本身
+  # （MpvLoader / MpvPlayer）能否正确编译链接、运行时能否成功加载 DLL。
+  # -------------------------------------------------------------------------
+  build-core:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download libmpv dev package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ github.event.inputs.libmpv_release_tag }}"
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            Write-Host "未指定 tag，获取最新 release..."
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ env.LIBMPV_REPO }}/releases/latest" -Headers @{ "User-Agent" = "NativePlayer-CI" }
+          } else {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ env.LIBMPV_REPO }}/releases/tags/$tag" -Headers @{ "User-Agent" = "NativePlayer-CI" }
+          }
+
+          $asset = $release.assets | Where-Object { $_.name -match "^mpv-dev-x86_64-.*\.7z$" } | Select-Object -First 1
+          if (-not $asset) {
+            Write-Error "未找到匹配 'mpv-dev-x86_64-*.7z' 的 release asset，release 里实际文件列表："
+            $release.assets | ForEach-Object { Write-Host " - $($_.name)" }
+            exit 1
+          }
+
+          Write-Host "下载: $($asset.name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "mpv-dev.7z"
+
+          7z x mpv-dev.7z -olibmpv_extracted -y | Out-Null
+
+          New-Item -ItemType Directory -Force -Path "third_party/libmpv/include" | Out-Null
+          New-Item -ItemType Directory -Force -Path "third_party/libmpv/lib" | Out-Null
+
+          Copy-Item -Recurse -Force "libmpv_extracted/include/*" "third_party/libmpv/include/"
+
+          # 不同 release 打包里 DLL 命名可能是 mpv-2.dll 或 libmpv-2.dll，统一改名。
+          $dll = Get-ChildItem -Recurse "libmpv_extracted" -Filter "*mpv-2.dll" | Select-Object -First 1
+          if (-not $dll) {
+            Write-Error "解压结果中未找到 mpv-2.dll / libmpv-2.dll"
+            Get-ChildItem -Recurse "libmpv_extracted" | ForEach-Object { Write-Host $_.FullName }
+            exit 1
+          }
+          Copy-Item -Force $dll.FullName "third_party/libmpv/lib/libmpv-2.dll"
+
+          Write-Host "libmpv 开发包放置完成："
+          Get-ChildItem -Recurse "third_party/libmpv" | ForEach-Object { Write-Host " - $($_.FullName)" }
+
+      - name: Verify client.h present
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "third_party/libmpv/include/mpv/client.h")) {
+            Write-Error "third_party/libmpv/include/mpv/client.h 缺失，libmpv 开发包放置失败"
+            exit 1
+          }
+
+      - name: Configure CMake (Core only)
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DNATIVEPLAYER_CORE_ONLY=ON `
+            -DNATIVEPLAYER_BUILD_TESTS=ON
+
+      - name: Build Core
+        shell: pwsh
+        run: cmake --build build --config Release --target PlayerCore PlayerCoreSmokeTest
+
+      - name: Copy libmpv-2.dll next to smoke test exe
+        shell: pwsh
+        run: |
+          $exeDir = Get-ChildItem -Recurse "build" -Filter "PlayerCoreSmokeTest.exe" | Select-Object -First 1 -ExpandProperty DirectoryName
+          Copy-Item -Force "third_party/libmpv/lib/libmpv-2.dll" $exeDir
+          echo "SMOKE_TEST_DIR=$exeDir" >> $env:GITHUB_ENV
+
+      - name: Run smoke test
+        shell: pwsh
+        run: |
+          & "$env:SMOKE_TEST_DIR\PlayerCoreSmokeTest.exe"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "冒烟测试失败，退出码 $LASTEXITCODE"
+            exit 1
+          }
+
+      - name: Upload Core build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: player-core-build
+          path: |
+            build/**/*.lib
+            build/**/PlayerCoreSmokeTest.exe
+            third_party/libmpv/lib/libmpv-2.dll
+          if-no-files-found: warn
+
+  # -------------------------------------------------------------------------
+  # Job 2: 尝试完整编译 WinUI3 App（手写 vcxproj + sln，通过 MSBuild）。
+  # 这一步风险明显更高：依赖 Windows App SDK / C++/WinRT / ANGLE 的 NuGet
+  # 还原，以及 XAML 编译器的正确配置。允许失败不阻塞 PR（continue-on-error），
+  # 但会保留完整日志和产物方便排查。
+  # -------------------------------------------------------------------------
+  build-app:
+    runs-on: windows-latest
+    continue-on-error: true
+    needs: build-core
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download libmpv dev package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ github.event.inputs.libmpv_release_tag }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ env.LIBMPV_REPO }}/releases/latest" -Headers @{ "User-Agent" = "NativePlayer-CI" }
+          } else {
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ env.LIBMPV_REPO }}/releases/tags/$tag" -Headers @{ "User-Agent" = "NativePlayer-CI" }
+          }
+          $asset = $release.assets | Where-Object { $_.name -match "^mpv-dev-x86_64-.*\.7z$" } | Select-Object -First 1
+          if (-not $asset) { Write-Error "未找到 mpv-dev asset"; exit 1 }
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "mpv-dev.7z"
+          7z x mpv-dev.7z -olibmpv_extracted -y | Out-Null
+          New-Item -ItemType Directory -Force -Path "third_party/libmpv/include" | Out-Null
+          New-Item -ItemType Directory -Force -Path "third_party/libmpv/lib" | Out-Null
+          Copy-Item -Recurse -Force "libmpv_extracted/include/*" "third_party/libmpv/include/"
+          $dll = Get-ChildItem -Recurse "libmpv_extracted" -Filter "*mpv-2.dll" | Select-Object -First 1
+          if (-not $dll) { Write-Error "未找到 mpv-2.dll"; exit 1 }
+          Copy-Item -Force $dll.FullName "third_party/libmpv/lib/libmpv-2.dll"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore NuGet packages (Windows App SDK / C++/WinRT / ANGLE)
+        shell: pwsh
+        run: nuget restore NativePlayer.sln
+
+      - name: Build App (Release|x64)
+        shell: pwsh
+        run: |
+          msbuild NativePlayer.sln `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:AppxBundlePlatforms="x64" `
+            /p:AppxPackageDir="build\AppPackages\" `
+            /p:GenerateAppxPackageOnBuild=false `
+            /m /nologo `
+            /flp:logfile=build\msbuild.log;verbosity=detailed
+
+      - name: Copy libmpv-2.dll into App output
+        if: always()
+        shell: pwsh
+        run: |
+          $exeDir = Get-ChildItem -Recurse "build\bin" -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty DirectoryName
+          if ($exeDir) {
+            Copy-Item -Force "third_party/libmpv/lib/libmpv-2.dll" $exeDir
+            Write-Host "已复制 libmpv-2.dll 到 $exeDir"
+          } else {
+            Write-Host "未找到 App 可执行文件，跳过复制（编译可能未成功，见下方日志上传）"
+          }
+
+      - name: Upload build log (always, for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msbuild-log
+          path: build/msbuild.log
+          if-no-files-found: warn
+
+      - name: Upload App build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-player-app-build
+          path: |
+            build/bin/**
+          if-no-files-found: warn
